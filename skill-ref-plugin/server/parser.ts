@@ -32,7 +32,10 @@ export interface AgentMeta {
   filePath: string;
 }
 
-const STEP_HEADER_RE = /^##\s+#(\d+(?:[~\-]#?\d+)?)\s+(.+)$/gm;
+// Matches multiple patterns:
+// "## #1 Title", "## Phase 1: Title (#1~#9)", "## Step 1: Title (#10~#16)"
+// "### Phase 1: Title", "### 1단계: Title", "### Step 1: Title"
+const STEP_HEADER_RE = /^#{2,3}\s+(?:#(\d+(?:[~\-]#?\d+)?)\s+(.+)|(?:Phase|Step)\s+(\d+)\s*:\s*(.+)|(\d+)단계\s*:\s*(.+))$/gm;
 const LOOPBACK_RE = /(?:FAIL|REJECT|REVISION|loopback|복귀|재시도|→\s*#).*?#(\d+)/gi;
 const SKILL_CALL_RE = /Skill\(\s*["']([^"']+)["']\s*\)/g;
 const AGENT_CALL_RE = /Agent\(\s*[^)]*subagent_type\s*=\s*["']([^"']+)["']/g;
@@ -76,11 +79,31 @@ function parseSteps(content: string): WorkflowStep[] {
   let match: RegExpExecArray | null;
   const re = new RegExp(STEP_HEADER_RE.source, STEP_HEADER_RE.flags);
   while ((match = re.exec(content)) !== null) {
-    headers.push({
-      stepNumber: `#${match[1]}`,
-      name: match[2].trim(),
-      index: match.index,
-    });
+    let stepNumber: string;
+    let name: string;
+
+    if (match[1]) {
+      // Pattern: "## #1 Title"
+      stepNumber = `#${match[1]}`;
+      name = match[2].trim();
+    } else if (match[3]) {
+      // Pattern: "## Phase 1: Title (#1~#9)" or "## Step 1: Title"
+      stepNumber = `#${match[3]}`;
+      name = match[4].trim();
+      const rangeMatch = name.match(/\(#(\d+(?:[~\-]#?\d+)?)\)\s*$/);
+      if (rangeMatch) {
+        stepNumber = `#${rangeMatch[1]}`;
+        name = name.replace(/\s*\(#\d+(?:[~\-]#?\d+)?\)\s*$/, '').trim();
+      }
+    } else if (match[5]) {
+      // Pattern: "### 1단계: Title"
+      stepNumber = `#${match[5]}`;
+      name = match[6].trim();
+    } else {
+      continue;
+    }
+
+    headers.push({ stepNumber, name, index: match.index });
   }
 
   for (let i = 0; i < headers.length; i++) {
