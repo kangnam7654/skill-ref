@@ -1,0 +1,10 @@
+{
+  "name": "skill-ref",
+  "version": "0.1.0",
+  "description": "Real-time interactive visualization of skill and agent reference relationships in Claude Code",
+  "author": {
+    "name": "kangnam"
+  },
+  "license": "MIT",
+  "keywords": ["visualization", "skills", "agents", "graph", "mcp"]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "skill-ref",
+  "version": "0.1.0",
+  "description": "Real-time interactive visualization of Claude Code skill/agent reference relationships",
+  "type": "module",
+  "scripts": {
+    "start": "tsx server/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "gray-matter": "^4.0.3",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

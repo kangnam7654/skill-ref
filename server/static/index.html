@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Skill/Agent Reference Graph</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a0f; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+  svg { width: 100vw; height: 100vh; display: block; }
+
+  #search {
+    position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    width: 320px; padding: 10px 16px; border-radius: 8px;
+    background: #1a1a2e; color: #e0e0e0; border: 1px solid #333;
+    font-size: 14px; outline: none; z-index: 10;
+  }
+  #search::placeholder { color: #666; }
+  #search:focus { border-color: #4A90D9; }
+
+  #detail {
+    position: fixed; top: 0; right: -360px; width: 340px; height: 100vh;
+    background: #1a1a2e; border-left: 1px solid #333; padding: 24px 20px;
+    color: #e0e0e0; z-index: 10; transition: right 0.3s ease;
+    overflow-y: auto;
+  }
+  #detail.open { right: 0; }
+  #detail h2 { font-size: 18px; margin-bottom: 4px; }
+  #detail .type-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 11px; font-weight: 600; text-transform: uppercase; margin-bottom: 12px;
+  }
+  #detail .type-badge.skill { background: #4A90D920; color: #4A90D9; }
+  #detail .type-badge.agent { background: #27AE6020; color: #27AE60; }
+  #detail .desc { color: #aaa; font-size: 13px; margin-bottom: 16px; line-height: 1.5; }
+  #detail .path { color: #666; font-size: 11px; word-break: break-all; margin-bottom: 16px; }
+  #detail .refs-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; color: #888; }
+  #detail .ref-item { font-size: 13px; padding: 4px 0; color: #bbb; cursor: pointer; }
+  #detail .ref-item:hover { color: #4A90D9; }
+  #detail-close {
+    position: absolute; top: 12px; right: 12px; background: none; border: none;
+    color: #666; font-size: 20px; cursor: pointer;
+  }
+  #detail-close:hover { color: #e0e0e0; }
+
+  #legend {
+    position: fixed; bottom: 16px; left: 16px; display: flex; gap: 16px;
+    background: #1a1a2e; padding: 8px 16px; border-radius: 8px;
+    border: 1px solid #333; z-index: 10;
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #aaa; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+
+  #stats {
+    position: fixed; bottom: 16px; right: 16px;
+    background: #1a1a2e; padding: 8px 16px; border-radius: 8px;
+    border: 1px solid #333; z-index: 10; font-size: 12px; color: #666;
+  }
+  #ws-status {
+    position: fixed; top: 16px; right: 16px;
+    width: 10px; height: 10px; border-radius: 50%;
+    z-index: 10; background: #e74c3c;
+  }
+  #ws-status.connected { background: #27AE60; }
+</style>
+</head>
+<body>
+
+<input type="text" id="search" placeholder="Search skills & agents..." />
+<div id="ws-status" title="WebSocket disconnected"></div>
+
+<div id="detail">
+  <button id="detail-close">&times;</button>
+  <h2 id="detail-name"></h2>
+  <span id="detail-type" class="type-badge"></span>
+  <p id="detail-desc" class="desc"></p>
+  <p id="detail-path" class="path"></p>
+  <div id="detail-refs-section">
+    <div class="refs-title">References</div>
+    <div id="detail-refs"></div>
+  </div>
+  <div id="detail-refby-section" style="margin-top: 16px;">
+    <div class="refs-title">Referenced By</div>
+    <div id="detail-refby"></div>
+  </div>
+</div>
+
+<div id="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#4A90D9"></div> Skill</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#27AE60"></div> Agent</div>
+</div>
+
+<div id="stats"></div>
+
+<svg></svg>
+
+<script>
+const SKILL_COLOR = '#4A90D9';
+const AGENT_COLOR = '#27AE60';
+
+let graphData = { nodes: [], edges: [] };
+let simulation, svg, g, linkGroup, nodeGroup, labelGroup;
+
+function nodeRadius(d) {
+  const degree = (d._inDegree || 0) + (d._outDegree || 0);
+  return Math.max(8, Math.min(24, 6 + degree * 3));
+}
+
+function nodeColor(d) {
+  return d.type === 'skill' ? SKILL_COLOR : AGENT_COLOR;
+}
+
+function init() {
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+
+  svg = d3.select('svg').attr('width', width).attr('height', height);
+
+  // Arrow marker
+  svg.append('defs').append('marker')
+    .attr('id', 'arrowhead')
+    .attr('viewBox', '0 0 10 10')
+    .attr('refX', 20)
+    .attr('refY', 5)
+    .attr('markerWidth', 6)
+    .attr('markerHeight', 6)
+    .attr('orient', 'auto-start-reverse')
+    .append('path')
+    .attr('d', 'M 0 0 L 10 5 L 0 10 Z')
+    .attr('fill', '#555');
+
+  g = svg.append('g');
+  linkGroup = g.append('g').attr('class', 'links');
+  nodeGroup = g.append('g').attr('class', 'nodes');
+  labelGroup = g.append('g').attr('class', 'labels');
+
+  // Zoom
+  const zoom = d3.zoom()
+    .scaleExtent([0.3, 5])
+    .on('zoom', (event) => g.attr('transform', event.transform));
+  svg.call(zoom);
+  svg._zoom = zoom;
+
+  simulation = d3.forceSimulation()
+    .force('link', d3.forceLink().id(d => d.id).distance(120))
+    .force('charge', d3.forceManyBody().strength(-300))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collide', d3.forceCollide().radius(d => nodeRadius(d) + 4));
+
+  // Resize
+  window.addEventListener('resize', () => {
+    const w = window.innerWidth, h = window.innerHeight;
+    svg.attr('width', w).attr('height', h);
+    simulation.force('center', d3.forceCenter(w / 2, h / 2));
+    simulation.alpha(0.3).restart();
+  });
+}
+
+function computeDegrees(nodes, edges) {
+  const inDeg = {}, outDeg = {};
+  edges.forEach(e => {
+    const src = typeof e.source === 'object' ? e.source.id : e.source;
+    const tgt = typeof e.target === 'object' ? e.target.id : e.target;
+    outDeg[src] = (outDeg[src] || 0) + 1;
+    inDeg[tgt] = (inDeg[tgt] || 0) + 1;
+  });
+  nodes.forEach(n => {
+    n._inDegree = inDeg[n.id] || 0;
+    n._outDegree = outDeg[n.id] || 0;
+  });
+}
+
+function renderFull(data) {
+  graphData = data;
+  const nodes = data.nodes.map(d => ({ ...d }));
+  const edges = data.edges.map(d => ({ ...d }));
+
+  computeDegrees(nodes, edges);
+
+  // Links
+  const link = linkGroup.selectAll('line').data(edges, d => `${d.source}->${d.target}`);
+  link.exit().remove();
+  const linkEnter = link.enter().append('line')
+    .attr('stroke', '#555')
+    .attr('stroke-width', 1.5)
+    .attr('marker-end', 'url(#arrowhead)');
+
+  // Nodes
+  const node = nodeGroup.selectAll('circle').data(nodes, d => d.id);
+  node.exit().remove();
+  const nodeEnter = node.enter().append('circle')
+    .attr('r', d => nodeRadius(d))
+    .attr('fill', d => nodeColor(d))
+    .attr('stroke', d => d3.color(nodeColor(d)).brighter(0.5))
+    .attr('stroke-width', 1.5)
+    .attr('cursor', 'pointer')
+    .call(d3.drag()
+      .on('start', dragStart)
+      .on('drag', dragging)
+      .on('end', dragEnd))
+    .on('mouseover', (event, d) => highlight(d))
+    .on('mouseout', () => unhighlight())
+    .on('click', (event, d) => showDetail(d));
+
+  // Labels
+  const label = labelGroup.selectAll('text').data(nodes, d => d.id);
+  label.exit().remove();
+  label.enter().append('text')
+    .text(d => d.name)
+    .attr('text-anchor', 'middle')
+    .attr('dy', d => nodeRadius(d) + 14)
+    .attr('fill', '#e0e0e0')
+    .attr('font-size', '11px')
+    .attr('pointer-events', 'none');
+
+  const allLinks = linkGroup.selectAll('line');
+  const allNodes = nodeGroup.selectAll('circle');
+  const allLabels = labelGroup.selectAll('text');
+
+  simulation.nodes(nodes);
+  simulation.force('link').links(edges);
+  simulation.alpha(1).restart();
+
+  simulation.on('tick', () => {
+    allLinks
+      .attr('x1', d => d.source.x)
+      .attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x)
+      .attr('y2', d => d.target.y);
+    allNodes.attr('cx', d => d.x).attr('cy', d => d.y);
+    allLabels.attr('x', d => d.x).attr('y', d => d.y);
+  });
+
+  updateStats(nodes, edges);
+}
+
+function applyDiff(diff) {
+  // Get current sim data
+  let nodes = simulation.nodes().slice();
+  let edges = simulation.force('link').links().map(l => ({
+    source: l.source.id,
+    target: l.target.id,
+  }));
+
+  // Remove nodes
+  if (diff.removedNodes?.length) {
+    const removeSet = new Set(diff.removedNodes);
+    nodes = nodes.filter(n => !removeSet.has(n.id));
+    edges = edges.filter(e => !removeSet.has(e.source) && !removeSet.has(e.target));
+  }
+
+  // Remove edges
+  if (diff.removedEdges?.length) {
+    const removeKeys = new Set(diff.removedEdges.map(e => `${e.source}->${e.target}`));
+    edges = edges.filter(e => !removeKeys.has(`${e.source}->${e.target}`));
+  }
+
+  // Add nodes
+  if (diff.addedNodes?.length) {
+    nodes.push(...diff.addedNodes.map(n => ({ ...n })));
+  }
+
+  // Add edges
+  if (diff.addedEdges?.length) {
+    edges.push(...diff.addedEdges.map(e => ({ ...e })));
+  }
+
+  // Update nodes
+  if (diff.updatedNodes?.length) {
+    const updateMap = new Map(diff.updatedNodes.map(n => [n.id, n]));
+    nodes.forEach(n => {
+      const u = updateMap.get(n.id);
+      if (u) { n.description = u.description; n.filePath = u.filePath; }
+    });
+  }
+
+  // Store for graph data
+  graphData = { nodes: nodes.map(n => ({ id: n.id, name: n.name, type: n.type, description: n.description, filePath: n.filePath })), edges, timestamp: Date.now() };
+
+  computeDegrees(nodes, edges);
+
+  // Re-bindlinks
+  const link = linkGroup.selectAll('line').data(edges, d => {
+    const src = typeof d.source === 'object' ? d.source.id : d.source;
+    const tgt = typeof d.target === 'object' ? d.target.id : d.target;
+    return `${src}->${tgt}`;
+  });
+  link.exit().transition().duration(300).attr('stroke-opacity', 0).remove();
+  link.enter().append('line')
+    .attr('stroke', '#555')
+    .attr('stroke-width', 1.5)
+    .attr('marker-end', 'url(#arrowhead)')
+    .attr('stroke-opacity', 0)
+    .transition().duration(500).attr('stroke-opacity', 1);
+
+  // Re-bind nodes
+  const node = nodeGroup.selectAll('circle').data(nodes, d => d.id);
+  node.exit().transition().duration(300).attr('r', 0).attr('opacity', 0).remove();
+  node.transition().duration(300).attr('r', d => nodeRadius(d));
+  node.enter().append('circle')
+    .attr('r', 0)
+    .attr('fill', d => nodeColor(d))
+    .attr('stroke', d => d3.color(nodeColor(d)).brighter(0.5))
+    .attr('stroke-width', 1.5)
+    .attr('cursor', 'pointer')
+    .attr('opacity', 0)
+    .call(d3.drag().on('start', dragStart).on('drag', dragging).on('end', dragEnd))
+    .on('mouseover', (event, d) => highlight(d))
+    .on('mouseout', () => unhighlight())
+    .on('click', (event, d) => showDetail(d))
+    .transition().duration(500)
+    .attr('r', d => nodeRadius(d))
+    .attr('opacity', 1);
+
+  // Re-bind labels
+  const label = labelGroup.selectAll('text').data(nodes, d => d.id);
+  label.exit().transition().duration(300).attr('opacity', 0).remove();
+  label.enter().append('text')
+    .text(d => d.name)
+    .attr('text-anchor', 'middle')
+    .attr('dy', d => nodeRadius(d) + 14)
+    .attr('fill', '#e0e0e0')
+    .attr('font-size', '11px')
+    .attr('pointer-events', 'none')
+    .attr('opacity', 0)
+    .transition().duration(500).attr('opacity', 1);
+
+  const allLinks = linkGroup.selectAll('line');
+  const allNodes = nodeGroup.selectAll('circle');
+  const allLabels = labelGroup.selectAll('text');
+
+  simulation.nodes(nodes);
+  simulation.force('link').links(edges);
+  simulation.alpha(0.5).restart();
+
+  simulation.on('tick', () => {
+    allLinks
+      .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    allNodes.attr('cx', d => d.x).attr('cy', d => d.y);
+    allLabels.attr('x', d => d.x).attr('y', d => d.y);
+  });
+
+  updateStats(nodes, edges);
+}
+
+function highlight(d) {
+  const connectedIds = new Set([d.id]);
+  graphData.edges.forEach(e => {
+    const src = typeof e.source === 'object' ? e.source.id : e.source;
+    const tgt = typeof e.target === 'object' ? e.target.id : e.target;
+    if (src === d.id) connectedIds.add(tgt);
+    if (tgt === d.id) connectedIds.add(src);
+  });
+
+  nodeGroup.selectAll('circle')
+    .transition().duration(200)
+    .attr('opacity', n => connectedIds.has(n.id) ? 1 : 0.15);
+  labelGroup.selectAll('text')
+    .transition().duration(200)
+    .attr('opacity', n => connectedIds.has(n.id) ? 1 : 0.15);
+  linkGroup.selectAll('line')
+    .transition().duration(200)
+    .attr('stroke-opacity', l => {
+      const src = typeof l.source === 'object' ? l.source.id : l.source;
+      const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+      return (src === d.id || tgt === d.id) ? 1 : 0.15;
+    });
+}
+
+function unhighlight() {
+  nodeGroup.selectAll('circle').transition().duration(200).attr('opacity', 1);
+  labelGroup.selectAll('text').transition().duration(200).attr('opacity', 1);
+  linkGroup.selectAll('line').transition().duration(200).attr('stroke-opacity', 1);
+}
+
+function showDetail(d) {
+  const panel = document.getElementById('detail');
+  document.getElementById('detail-name').textContent = d.name;
+  const badge = document.getElementById('detail-type');
+  badge.textContent = d.type;
+  badge.className = `type-badge ${d.type}`;
+  document.getElementById('detail-desc').textContent = d.description || '(no description)';
+  document.getElementById('detail-path').textContent = d.filePath;
+
+  // References (outgoing)
+  const refsDiv = document.getElementById('detail-refs');
+  refsDiv.innerHTML = '';
+  const outgoing = graphData.edges
+    .filter(e => (typeof e.source === 'object' ? e.source.id : e.source) === d.id)
+    .map(e => typeof e.target === 'object' ? e.target.id : e.target);
+  if (outgoing.length === 0) {
+    refsDiv.innerHTML = '<div class="ref-item" style="color:#555">(none)</div>';
+  } else {
+    outgoing.forEach(tid => {
+      const targetNode = simulation.nodes().find(n => n.id === tid);
+      const el = document.createElement('div');
+      el.className = 'ref-item';
+      el.textContent = targetNode ? targetNode.name : tid;
+      el.onclick = () => { if (targetNode) focusNode(targetNode); };
+      refsDiv.appendChild(el);
+    });
+  }
+
+  // Referenced by (incoming)
+  const refbyDiv = document.getElementById('detail-refby');
+  refbyDiv.innerHTML = '';
+  const incoming = graphData.edges
+    .filter(e => (typeof e.target === 'object' ? e.target.id : e.target) === d.id)
+    .map(e => typeof e.source === 'object' ? e.source.id : e.source);
+  if (incoming.length === 0) {
+    refbyDiv.innerHTML = '<div class="ref-item" style="color:#555">(none)</div>';
+  } else {
+    incoming.forEach(sid => {
+      const srcNode = simulation.nodes().find(n => n.id === sid);
+      const el = document.createElement('div');
+      el.className = 'ref-item';
+      el.textContent = srcNode ? srcNode.name : sid;
+      el.onclick = () => { if (srcNode) focusNode(srcNode); };
+      refbyDiv.appendChild(el);
+    });
+  }
+
+  panel.classList.add('open');
+}
+
+function focusNode(d) {
+  const width = window.innerWidth, height = window.innerHeight;
+  const transform = d3.zoomIdentity
+    .translate(width / 2 - d.x * 1.5, height / 2 - d.y * 1.5)
+    .scale(1.5);
+  svg.transition().duration(500).call(svg._zoom.transform, transform);
+  highlight(d);
+  showDetail(d);
+}
+
+function updateStats(nodes, edges) {
+  const skills = nodes.filter(n => n.type === 'skill').length;
+  const agents = nodes.filter(n => n.type === 'agent').length;
+  document.getElementById('stats').textContent =
+    `${skills} skills, ${agents} agents, ${edges.length} edges`;
+}
+
+// Drag handlers
+function dragStart(event, d) {
+  if (!event.active) simulation.alphaTarget(0.3).restart();
+  d.fx = d.x; d.fy = d.y;
+}
+function dragging(event, d) { d.fx = event.x; d.fy = event.y; }
+function dragEnd(event, d) {
+  if (!event.active) simulation.alphaTarget(0);
+  d.fx = null; d.fy = null;
+}
+
+// Search
+document.getElementById('search').addEventListener('input', (e) => {
+  const q = e.target.value.toLowerCase().trim();
+  if (!q) { unhighlight(); return; }
+  const matches = new Set();
+  simulation.nodes().forEach(n => {
+    if (n.name.toLowerCase().includes(q) || (n.description || '').toLowerCase().includes(q)) {
+      matches.add(n.id);
+    }
+  });
+  nodeGroup.selectAll('circle')
+    .transition().duration(200)
+    .attr('opacity', d => matches.has(d.id) ? 1 : 0.15);
+  labelGroup.selectAll('text')
+    .transition().duration(200)
+    .attr('opacity', d => matches.has(d.id) ? 1 : 0.15);
+  linkGroup.selectAll('line')
+    .transition().duration(200).attr('stroke-opacity', 0.15);
+});
+
+document.getElementById('search').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    const q = e.target.value.toLowerCase().trim();
+    const found = simulation.nodes().find(n =>
+      n.name.toLowerCase().includes(q) || (n.description || '').toLowerCase().includes(q)
+    );
+    if (found) focusNode(found);
+  }
+});
+
+// Close detail
+document.getElementById('detail-close').addEventListener('click', () => {
+  document.getElementById('detail').classList.remove('open');
+  unhighlight();
+});
+
+// WebSocket
+function connectWS() {
+  const wsUrl = `ws://${location.host}`;
+  const ws = new WebSocket(wsUrl);
+  const indicator = document.getElementById('ws-status');
+
+  ws.onopen = () => {
+    indicator.className = 'connected';
+    indicator.title = 'WebSocket connected';
+  };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'full') renderFull(msg.data);
+    else if (msg.type === 'diff') applyDiff(msg.data);
+  };
+
+  ws.onclose = () => {
+    indicator.className = '';
+    indicator.title = 'WebSocket disconnected';
+    setTimeout(connectWS, 2000);
+  };
+}
+
+// Boot
+init();
+connectWS();
+</script>
+</body>
+</html>
