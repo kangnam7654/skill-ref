@@ -3,13 +3,13 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
-import type { GraphData, GraphDiff } from './graph.js';
+import type { WorkflowData } from './graph.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export interface WebServer {
   port: number;
-  broadcast(diff: GraphDiff): void;
+  broadcastFull(data: WorkflowData): void;
   close(): Promise<void>;
 }
 
@@ -28,7 +28,7 @@ function tryListen(
 
 export async function startWebServer(
   port: number,
-  getGraph: () => GraphData,
+  getData: () => WorkflowData,
 ): Promise<WebServer> {
   const htmlPath = path.join(__dirname, 'static', 'index.html');
 
@@ -43,7 +43,6 @@ export async function startWebServer(
     }
   });
 
-  // Try ports 7890-7899
   let actualPort = port;
   let bound = false;
   for (let p = port; p <= port + 9; p++) {
@@ -66,19 +65,20 @@ export async function startWebServer(
 
   wss.on('connection', (ws) => {
     clients.add(ws);
-    ws.send(JSON.stringify({ type: 'full', data: getGraph() }));
+    ws.send(JSON.stringify({ type: 'full', data: getData() }));
     ws.on('close', () => clients.delete(ws));
   });
 
+  function sendAll(msg: string) {
+    for (const ws of clients) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+    }
+  }
+
   return {
     port: actualPort,
-    broadcast(diff: GraphDiff) {
-      const msg = JSON.stringify({ type: 'diff', data: diff });
-      for (const ws of clients) {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(msg);
-        }
-      }
+    broadcastFull(data: WorkflowData) {
+      sendAll(JSON.stringify({ type: 'full', data }));
     },
     close() {
       return new Promise((resolve) => {

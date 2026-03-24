@@ -2,43 +2,35 @@ import { readFile } from 'node:fs/promises';
 import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
-import { parseFile, extractReferences, type ParsedNode } from './parser.js';
+import {
+  parseSkillWorkflow,
+  parseAgentMeta,
+  extractCallees,
+  type SkillWorkflow,
+  type AgentMeta,
+  type Callee,
+} from './parser.js';
 
-export interface Node {
+export interface WorkflowTreeNode {
   id: string;
+  type: 'skill-root' | 'step' | 'agent-leaf';
   name: string;
-  type: 'skill' | 'agent';
-  description: string;
-  filePath: string;
+  stepNumber?: string;
+  description?: string;
+  callees?: Callee[];
+  loopbacks?: { targetStep: string; condition: string }[];
+  children?: WorkflowTreeNode[];
 }
 
-export interface Edge {
-  source: string;
-  target: string;
-  label?: string;
-}
-
-export interface GraphData {
-  nodes: Node[];
-  edges: Edge[];
+export interface WorkflowData {
+  skills: SkillWorkflow[];
+  agents: AgentMeta[];
+  trees: WorkflowTreeNode[];
   timestamp: number;
 }
 
-export interface GraphDiff {
-  addedNodes: Node[];
-  removedNodes: string[];
-  updatedNodes: Node[];
-  addedEdges: Edge[];
-  removedEdges: Edge[];
-}
-
-function edgeKey(e: Edge): string {
-  return `${e.source}->${e.target}`;
-}
-
-async function collectFiles(dir: string, type: 'skill' | 'agent'): Promise<string[]> {
+function collectFiles(dir: string, type: 'skill' | 'agent'): string[] {
   if (!fs.existsSync(dir)) return [];
-
   const files: string[] = [];
 
   if (type === 'skill') {
@@ -47,9 +39,7 @@ async function collectFiles(dir: string, type: 'skill' | 'agent'): Promise<strin
       if (!entry.isDirectory()) continue;
       if (entry.name.endsWith('-workspace')) continue;
       const skillFile = path.join(dir, entry.name, 'SKILL.md');
-      if (fs.existsSync(skillFile)) {
-        files.push(skillFile);
-      }
+      if (fs.existsSync(skillFile)) files.push(skillFile);
     }
   } else {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -59,91 +49,142 @@ async function collectFiles(dir: string, type: 'skill' | 'agent'): Promise<strin
       }
     }
   }
-
   return files;
 }
 
-export async function buildGraph(skillsDir: string, agentsDir: string): Promise<GraphData> {
-  const skillFiles = await collectFiles(skillsDir, 'skill');
-  const agentFiles = await collectFiles(agentsDir, 'agent');
-  const allFiles = [...skillFiles, ...agentFiles];
+export async function buildWorkflowData(
+  skillsDir: string,
+  agentsDir: string,
+): Promise<WorkflowData> {
+  const skillFiles = collectFiles(skillsDir, 'skill');
+  const agentFiles = collectFiles(agentsDir, 'agent');
 
-  // 1st pass: parse all files to get names
-  const parsedNodes: ParsedNode[] = [];
-  for (const file of allFiles) {
-    const node = await parseFile(file);
-    if (node) parsedNodes.push(node);
+  // 1st pass: parse all skills and agents
+  const skills: SkillWorkflow[] = [];
+  for (const f of skillFiles) {
+    const sw = await parseSkillWorkflow(f);
+    if (sw) skills.push(sw);
   }
 
-  const knownNames = new Set(parsedNodes.map((n) => n.name));
-
-  // 2nd pass: extract references
-  for (const node of parsedNodes) {
-    try {
-      const raw = await readFile(node.filePath, 'utf-8');
-      const { data: frontmatter, content } = matter(raw);
-      const fullText = `${frontmatter.description || ''} ${content}`;
-      const refs = extractReferences(fullText, knownNames);
-      node.references = refs.filter((r) => r !== node.name);
-    } catch {
-      // keep empty references
-    }
+  const agents: AgentMeta[] = [];
+  for (const f of agentFiles) {
+    const am = await parseAgentMeta(f);
+    if (am) agents.push(am);
   }
 
-  // Build nodes and edges
-  const nodes: Node[] = parsedNodes.map((p) => ({
-    id: p.id,
-    name: p.name,
-    type: p.type,
-    description: p.description,
-    filePath: p.filePath,
-  }));
+  const knownSkills = new Set(skills.map((s) => s.name));
+  const knownAgents = new Set(agents.map((a) => a.name));
 
-  const nodeIdByName = new Map(parsedNodes.map((p) => [p.name, p.id]));
-  const edges: Edge[] = [];
+  // 2nd pass: extract callees for each step using known names
+  for (const skill of skills) {
+    for (const step of skill.steps) {
+      try {
+        const raw = await readFile(skill.filePath, 'utf-8');
+        const { content } = matter(raw);
 
-  for (const p of parsedNodes) {
-    for (const refName of p.references) {
-      const targetId = nodeIdByName.get(refName);
-      if (targetId) {
-        edges.push({ source: p.id, target: targetId });
+        // Find step body
+        const headerRe = new RegExp(
+          `^##\\s+${step.stepNumber.replace('#', '#')}\\b.*$`,
+          'm',
+        );
+        const headerMatch = headerRe.exec(content);
+        if (headerMatch) {
+          const start = headerMatch.index;
+          const nextHeader = content.indexOf('\n## ', start + 1);
+          const body = content.slice(start, nextHeader > 0 ? nextHeader : undefined);
+
+          const callees = extractCallees(body, knownSkills, knownAgents);
+          step.callees = callees.filter((c) => c.name !== skill.name);
+        }
+      } catch {
+        // keep empty callees
       }
     }
   }
 
-  return { nodes, edges, timestamp: Date.now() };
-}
-
-export function diffGraph(prev: GraphData, next: GraphData): GraphDiff {
-  const prevNodeMap = new Map(prev.nodes.map((n) => [n.id, n]));
-  const nextNodeMap = new Map(next.nodes.map((n) => [n.id, n]));
-
-  const addedNodes: Node[] = [];
-  const removedNodes: string[] = [];
-  const updatedNodes: Node[] = [];
-
-  for (const [id, node] of nextNodeMap) {
-    if (!prevNodeMap.has(id)) {
-      addedNodes.push(node);
-    } else {
-      const prevNode = prevNodeMap.get(id)!;
-      if (prevNode.description !== node.description || prevNode.filePath !== node.filePath) {
-        updatedNodes.push(node);
+  // Determine which skills are called by other skills (sub-skills)
+  const calledSkillNames = new Set<string>();
+  for (const skill of skills) {
+    for (const step of skill.steps) {
+      for (const c of step.callees) {
+        if (c.type === 'skill') calledSkillNames.add(c.name);
       }
     }
   }
 
-  for (const id of prevNodeMap.keys()) {
-    if (!nextNodeMap.has(id)) {
-      removedNodes.push(id);
+  // Build skill lookup
+  const skillMap = new Map(skills.map((s) => [s.name, s]));
+
+  // Build workflow trees
+  function buildTree(skill: SkillWorkflow, expanded: Set<string>): WorkflowTreeNode {
+    const children: WorkflowTreeNode[] = [];
+
+    for (const step of skill.steps) {
+      const stepNode: WorkflowTreeNode = {
+        id: `skill:${skill.name}:${step.stepNumber}`,
+        type: 'step',
+        name: step.name,
+        stepNumber: step.stepNumber,
+        callees: step.callees,
+        loopbacks: step.loopbacks,
+        children: [],
+      };
+
+      // Add callee children
+      for (const callee of step.callees) {
+        if (callee.type === 'skill' && skillMap.has(callee.name) && !expanded.has(callee.name)) {
+          // Expand sub-skill as nested tree
+          const subSkill = skillMap.get(callee.name)!;
+          expanded.add(callee.name);
+          const subTree = buildTree(subSkill, expanded);
+          stepNode.children!.push(subTree);
+        } else if (callee.type === 'agent') {
+          stepNode.children!.push({
+            id: `agent:${callee.name}:in:${skill.name}:${step.stepNumber}`,
+            type: 'agent-leaf',
+            name: callee.name,
+          });
+        }
+      }
+
+      if (stepNode.children!.length === 0 && step.callees.length === 0) {
+        // Logic-only step, mark it
+        stepNode.callees = [{ name: 'logic', type: 'logic' }];
+      }
+
+      children.push(stepNode);
     }
+
+    return {
+      id: `skill:${skill.name}`,
+      type: 'skill-root',
+      name: skill.name,
+      description: skill.description,
+      children,
+    };
   }
 
-  const prevEdgeSet = new Set(prev.edges.map(edgeKey));
-  const nextEdgeSet = new Set(next.edges.map(edgeKey));
+  // Root skills = skills not called by other skills
+  const rootSkillNames = skills
+    .filter((s) => !calledSkillNames.has(s.name))
+    .map((s) => s.name);
 
-  const addedEdges = next.edges.filter((e) => !prevEdgeSet.has(edgeKey(e)));
-  const removedEdges = prev.edges.filter((e) => !nextEdgeSet.has(edgeKey(e)));
+  // Also include skills that have workflows but are called (for standalone view)
+  const trees: WorkflowTreeNode[] = [];
 
-  return { addedNodes, removedNodes, updatedNodes, addedEdges, removedEdges };
+  // Build root trees (with full expansion)
+  for (const name of rootSkillNames) {
+    const skill = skillMap.get(name)!;
+    if (skill.steps.length === 0) continue;
+    trees.push(buildTree(skill, new Set([name])));
+  }
+
+  // Build standalone trees for sub-skills (without expansion of their own children)
+  for (const name of calledSkillNames) {
+    const skill = skillMap.get(name);
+    if (!skill || skill.steps.length === 0) continue;
+    trees.push(buildTree(skill, new Set([name])));
+  }
+
+  return { skills, agents, trees, timestamp: Date.now() };
 }

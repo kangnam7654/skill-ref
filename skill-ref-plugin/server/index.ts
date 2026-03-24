@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { buildGraph, diffGraph, type GraphData } from './graph.js';
+import { buildWorkflowData, type WorkflowData } from './graph.js';
 import { createWatcher } from './watcher.js';
 import { startWebServer, type WebServer } from './web-server.js';
 
@@ -15,23 +15,21 @@ const homeDir = os.homedir();
 const skillsDir = path.join(homeDir, '.claude', 'skills');
 const agentsDir = path.join(homeDir, '.claude', 'agents');
 
-let currentGraph: GraphData = { nodes: [], edges: [], timestamp: 0 };
+let currentData: WorkflowData = { skills: [], agents: [], trees: [], timestamp: 0 };
 let webServer: WebServer | null = null;
 
 async function rebuildAndBroadcast() {
-  const next = await buildGraph(skillsDir, agentsDir);
-  const diff = diffGraph(currentGraph, next);
-  currentGraph = next;
-  if (webServer) webServer.broadcast(diff);
+  currentData = await buildWorkflowData(skillsDir, agentsDir);
+  if (webServer) webServer.broadcastFull(currentData);
 }
 
 async function main() {
-  // Build initial graph
-  currentGraph = await buildGraph(skillsDir, agentsDir);
+  // Build initial workflow data
+  currentData = await buildWorkflowData(skillsDir, agentsDir);
 
   // Start web server
   try {
-    webServer = await startWebServer(7890, () => currentGraph);
+    webServer = await startWebServer(7890, () => currentData);
     process.stderr.write(`[skill-ref] Viewer at http://localhost:${webServer.port}\n`);
   } catch (err) {
     process.stderr.write(`[skill-ref] Web server failed: ${err}\n`);
@@ -55,13 +53,13 @@ async function main() {
       {
         name: 'scan_graph',
         description:
-          'Returns the current skill/agent reference graph as JSON. Contains nodes (skills and agents) and edges (references between them).',
+          'Returns the current skill workflow data as JSON. Contains skill workflows with steps, agent metadata, and expanded workflow trees.',
         inputSchema: { type: 'object' as const, properties: {} },
       },
       {
         name: 'open_viewer',
         description:
-          'Opens the interactive graph viewer in the default browser.',
+          'Opens the interactive workflow viewer in the default browser.',
         inputSchema: { type: 'object' as const, properties: {} },
       },
     ],
@@ -72,7 +70,7 @@ async function main() {
 
     if (name === 'scan_graph') {
       return {
-        content: [{ type: 'text', text: JSON.stringify(currentGraph, null, 2) }],
+        content: [{ type: 'text', text: JSON.stringify(currentData, null, 2) }],
       };
     }
 
